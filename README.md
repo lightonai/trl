@@ -1,3 +1,12 @@
+# NOTE NOTE NOTE
+
+**Yo this is a trl fork**
+
+- it adds multi turn RL GRPO with environments
+- It's meant to remain compatible with unsloth
+
+which is why it's hacky af
+
 # TRL - Transformer Reinforcement Learning
 
 <div style="text-align: center">
