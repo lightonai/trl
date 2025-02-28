@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import textwrap
 import warnings
@@ -327,7 +328,6 @@ class MyGRPOTrainer(Trainer):
                         max_model_len=self.args.vllm_max_model_len,
                     )
                 self.sampling_params = SamplingParams(
-                    n=self.num_generations,
                     temperature=args.temperature,
                     max_tokens=self.max_completion_length,
                 )
@@ -343,7 +343,6 @@ class MyGRPOTrainer(Trainer):
                 max_new_tokens=self.max_completion_length,
                 do_sample=True,
                 temperature=args.temperature,
-                num_return_sequences=self.num_generations,
                 pad_token_id=processing_class.pad_token_id,
             )
 
@@ -399,8 +398,12 @@ class MyGRPOTrainer(Trainer):
     def _gen_text(self, prompts):
         return self.llm.generate(prompts, sampling_params=self.sampling_params, use_tqdm=False)
 
-    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+    def _prepare_inputs(self, unrepeated_inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
+        inputs = []
+        for inp in unrepeated_inputs:
+            for _ in range(self.num_generations):
+                inputs.append(copy.deepcopy(inp))
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(
@@ -417,7 +420,7 @@ class MyGRPOTrainer(Trainer):
         for key in reward_kwargs:
             for example in inputs:
                 # Repeat each value in the column for `num_generations` times
-                reward_kwargs[key].extend([example[key]] * self.num_generations)
+                reward_kwargs[key].extend([example[key]])
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
@@ -441,22 +444,20 @@ class MyGRPOTrainer(Trainer):
                 outputs = self.execute(all_prompts_text, self._gen_text, **reward_kwargs)
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
-                completion_ids = [None] * len(all_prompts_text) * self.num_generations
+                completion_ids = [None] * len(all_prompts_text)
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
             process_slice = slice(
-                self.accelerator.process_index * len(prompts) * self.num_generations,
-                (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts)
             )
             completion_ids = completion_ids[process_slice]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
-            prompt_ids = torch.repeat_interleave(prompt_ids, self.num_generations, dim=0)
-            prompt_mask = torch.repeat_interleave(prompt_mask, self.num_generations, dim=0)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
             # Regular generation path
@@ -469,7 +470,6 @@ class MyGRPOTrainer(Trainer):
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
-            prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -498,9 +498,6 @@ class MyGRPOTrainer(Trainer):
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
-
-        # Compute the rewards
-        prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]  # repeat prompts
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
