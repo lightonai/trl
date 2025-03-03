@@ -483,8 +483,6 @@ class MyGRPOTrainer(Trainer):
                     ref_per_token_logps = self._get_per_token_logps(
                         self.model, prompt_completion_ids, attention_mask
                     )
-            # FIXME: remove me and use mask
-            ref_per_token_logps = ref_per_token_logps[:, -logits_to_keep:]
 
         # Decode the generated completions
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -556,10 +554,14 @@ class MyGRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask)
+        # FIXME: use mask
+        per_token_logps = per_token_logps[:, -logits_to_keep:]
 
         # Compute the KL divergence between the model and the reference model
         ref_per_token_logps = inputs["ref_per_token_logps"]
+        # FIXME: use mask
+        ref_per_token_logps = ref_per_token_logps[:, -logits_to_keep:]
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
 
         # x - x.detach() allows for preserving gradients from x
