@@ -459,16 +459,7 @@ class MyGRPOTrainer(Trainer):
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
-            # Regular generation path
-            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
-                )
-
-            # Compute prompt length and extract completion ids
-            prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]
+            assert False, "vLLM needed"
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
