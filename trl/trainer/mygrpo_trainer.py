@@ -376,17 +376,16 @@ class MyGRPOTrainer(Trainer):
             self._signature_columns = ["prompt"]
 
     # Get the per-token log probabilities for the completions for the model and the reference model
-    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
+    def _get_per_token_logps(self, model, input_ids, attention_mask):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(
-            input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1
+            input_ids=input_ids, attention_mask=attention_mask,
         ).logits  # (B, L, V)
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+        input_ids = input_ids[:, 1:]
 
-        input_ids = input_ids[:, -logits_to_keep:]
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
-        logits = logits[:, -logits_to_keep:]
 
         # Compute the log probabilities for the input tokens.
         token_logits = logits.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
@@ -486,13 +485,15 @@ class MyGRPOTrainer(Trainer):
         with torch.inference_mode():
             if self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                    self.ref_model, prompt_completion_ids, attention_mask
                 )
             else:
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(
-                        self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                        self.model, prompt_completion_ids, attention_mask
                     )
+            # FIXME: remove me and use mask
+            ref_per_token_logps = ref_per_token_logps[:, -logits_to_keep:]
 
         # Decode the generated completions
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
