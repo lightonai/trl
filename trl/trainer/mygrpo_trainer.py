@@ -153,7 +153,7 @@ class MyGRPOTrainer(Trainer):
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
-        execute,
+        step_fn,
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
         args: MyGRPOConfig = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
@@ -164,7 +164,7 @@ class MyGRPOTrainer(Trainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
     ):
-        self.execute = execute
+        self.step_fn = step_fn
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -378,7 +378,7 @@ class MyGRPOTrainer(Trainer):
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-        logits = model( input_ids=input_ids).logits  # (B, L, V)
+        logits = model(input_ids=input_ids).logits  # (B, L, V)
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
         input_ids = input_ids[:, 1:]
 
@@ -386,26 +386,56 @@ class MyGRPOTrainer(Trainer):
         # See https://github.com/huggingface/trl/issues/2770
 
         # Compute the log probabilities for the input tokens.
+        print("LOGITS", logits.shape, "IDS", input_ids.shape)
         token_logits = logits.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
         # use a loop to reduce memory peak
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
         token_log_probs = token_logits - logsumexp_values  # log_softmax = logits - log(sum(exp(logits)))
         return token_log_probs
 
-    def _gen_text(self, prompts, mask=None):
-        if mask is None:
-            mask = [[] for _ in range(len(prompts))]
-
+    def _gen_text(self, prompts, mask=None, tokens=None, **kwargs):
         out = self.llm.chat(prompts, sampling_params=self.sampling_params, use_tqdm=False)
 
-        for p, o, m in zip(prompts, out, mask):
-            assert len(o.outputs) == 1, f"supports only one completion, got {len(o.outputs)}"
-            m += [0] * (len(o.prompt_token_ids) - len(m))
-            m += [1] * len(o.outputs[0].token_ids)
-            assert len(m) == len(o.prompt_token_ids) + len(o.outputs[0].token_ids), "Inconsistent size of mask and tokens"
+        for p, o in zip(prompts, out):
             p.append({"role":"assistant", "content": o.outputs[0].text})
 
-        return out, mask
+        if mask is not None:
+            for o, m in zip(out, mask):
+                assert len(o.outputs) == 1, f"supports only one completion, got {len(o.outputs)}"
+                m += [0] * (len(o.prompt_token_ids) - len(m))
+                m += [1] * len(o.outputs[0].token_ids)
+                assert len(m) == len(o.prompt_token_ids) + len(o.outputs[0].token_ids), "Inconsistent size of mask and tokens"
+                #assert m[len(o.prompt_token_ids)-1] == 0
+                #assert m[len(o.prompt_token_ids)] == 1
+
+        if tokens is not None:
+            for o, t in zip(out, tokens):
+                t[:] = o.prompt_token_ids + list(o.outputs[0].token_ids)
+
+
+    def execute(self, messages, **kwargs):
+        ended = [False] * len(messages)
+        mask = [[] for _ in range(len(messages))]
+        tokens = [[] for _ in range(len(messages))]
+
+        while not all(ended):
+            self._gen_text(
+                    [messages[i] for i in range(len(ended)) if not ended[i]],
+                    mask=[mask[i] for i in range(len(ended)) if not ended[i]],
+                    tokens=[tokens[i] for i in range(len(ended)) if not ended[i]],
+            )
+            assert len(ended) == len(mask)
+            for i in range(len(messages)):
+                if ended[i]:
+                    continue
+                reply = self.step_fn(messages[i], **{k: v[i] for k, v in kwargs.items()})
+                if reply is None:
+                    ended[i] = True
+                    continue
+                messages[i].append(reply)
+
+        return tokens, mask
+
 
     def _prepare_inputs(self, unrepeated_inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
@@ -415,11 +445,6 @@ class MyGRPOTrainer(Trainer):
                 inputs.append(copy.deepcopy(inp))
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
-            prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
-        )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        prompt_ids = prompt_inputs["input_ids"]
 
         assert self.max_prompt_length is None, f"max_prompt_length unsupported but set to {self.max_prompt_length}"
 
@@ -448,24 +473,33 @@ class MyGRPOTrainer(Trainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                messages, mask = self.execute(copy.deepcopy(prompts), self._gen_text, **reward_kwargs)
+                messages = copy.deepcopy(prompts)
+                messages_ids, mask = self.execute(messages, **reward_kwargs)
                 # This looks weird but it gracefully handles meta tokens. prompt inserts the tokens for the next
                 # assistant turn, while completion doesn't.
-                messages_text = [maybe_apply_chat_template({"prompt": m[:-1], "completion": m[-1:]}, self.processing_class) for m in messages]
-                messages_text = [m["prompt"] + m["completion"] for m in messages_text]
-                messages_ids = [
-                    self.processing_class(m, return_tensors="pt", padding=False, padding_side="right")["input_ids"][0].tolist()
-                    for m in messages_text
-                ]
+                if False:
+                    messages_text = [maybe_apply_chat_template({"prompt": m[:-1], "completion": m[-1:]}, self.processing_class) for m in messages]
+                    messages_text = [m["prompt"] + m["completion"] for m in messages_text]
+                    messages_ids = [
+                        self.processing_class(m, return_tensors="pt", padding=False, padding_side="right")["input_ids"][0].tolist()
+                        for m in messages_text
+                    ]
                 for i in range(len(messages_ids)):
-                    msg, mas = messages_ids[i], mask[i]
-                    print(
-                        list(zip(self.processing_class.batch_decode([[m_i] for m_i in msg], skip_special_tokens=True), mas)))
-                    mask[i] = mask[i][:len(msg)]
+                    messages_ids[i] = messages_ids[i][:self.model.max_seq_length]
+                    mask[i] = mask[i][:self.model.max_seq_length]
+                    if len(messages_ids[i]) != len(mask[i]):
+                        #print(messages_text[i])
+                        print(list(zip(
+                            self.processing_class.batch_decode([[m_i] for m_i in messages_ids[i]], skip_special_tokens=False) + [None] * max(0, len(mask[i]) - len(messages_ids[i])),
+                            mask[i] + [None] * max(0, len(messages_ids[i]) - len(mask[i]))
+                        )))
+                        print(f"{len(messages_ids[i])=} vs {len(mask[i])=}")
+                        assert False
             else:
                 messages_ids = [None] * len(all_prompts_text)
                 mask = [None] * len(all_prompts_text)
 
+            print("MSG", [len(m) for m in messages_ids], "MASK", [len(m) for m in mask])
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
             messages_ids = broadcast_object_list(messages_ids, from_process=0)
@@ -502,7 +536,10 @@ class MyGRPOTrainer(Trainer):
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                output_reward_func = reward_func(messages=messages, **reward_kwargs)
+                output_reward_func = [
+                        reward_func(messages=messages[j], **{k: v[j] for k, v in reward_kwargs.items()})
+                        for j in range(len(prompts))
+                ]
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # Sum the rewards from all reward functions
