@@ -155,6 +155,7 @@ class MyGRPOTrainer(Trainer):
         model: Union[str, PreTrainedModel],
         step_fn,
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        metric_funcs: list,
         args: MyGRPOConfig = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
@@ -164,6 +165,7 @@ class MyGRPOTrainer(Trainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
     ):
+        self.metric_funcs = metric_funcs
         self.step_fn = step_fn
         # Args
         if args is None:
@@ -565,6 +567,14 @@ class MyGRPOTrainer(Trainer):
 
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
+
+        for metric_func in self.metric_funcs:
+            output_metric_func = [
+                    metric_func(messages=messages[j], **{k: v[j] for k, v in reward_kwargs.items()})
+                    for j in range(len(prompts))
+            ]
+            metric_name = metric_func.__name__
+            self._metrics[f"metrics/{metric_name}"].append(torch.tensor(output_metric_func, dtype=float).mean().item())
 
         # must merge prompt_ids and completion_ids
         return {
